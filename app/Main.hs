@@ -3,37 +3,45 @@
 {-# LANGUAGE OverloadedStrings     #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 
-module Main where
+{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
 
+module Main where
 import Control.Lens ((?~), at)
-import Control.Monad (void)
+import Control.Monad (void, forM)
 import Data.Aeson (FromJSON, ToJSON, Value (Object, String), toJSON)
 import Data.Aeson.KeyMap (union)
 import Data.Aeson.Lens (_Object)
+import Data.List (sortBy)
 import qualified Data.Text as T
 import Data.Time
-  ( UTCTime, defaultTimeLocale, formatTime, getCurrentTime
-  , iso8601DateFormat, parseTimeOrError)
+  ( UTCTime, defaultTimeLocale, getCurrentTime, parseTimeOrError)
+--   , formatTime, iso8601DateFormat, parseTimeOrError)
 import Development.Shake
   ( Action, Verbosity(Verbose), copyFileChanged, forP, getDirectoryFiles
-  , liftIO, readFile', shakeLintInside, shakeOptions, shakeVerbosity
+  , liftIO, readFile', shakeLintInside, shakeOptions, shakeVerbosity, shakeRebuild, Rebuild (..)
   , writeFile')
+import Data.Time.Format.ISO8601
 import Development.Shake.Classes (Binary)
 import Development.Shake.FilePath ((</>), (-<.>), dropDirectory1)
 import Development.Shake.Forward (cacheAction, shakeArgsForward)
+import qualified Data.HashMap.Lazy as HML
 import GHC.Generics (Generic)
 import Slick (compileTemplate', convert, markdownToHTML, substitute)
+import Slick.Pandoc (markdownToHTMLWithOpts)
+import Text.Pandoc.Options
+import Text.Pandoc.Highlighting (tango)
 
+-- import Debug.Trace (trace)
 
 ---Config-----------------------------------------------------------------------
 
 siteMeta :: SiteMeta
 siteMeta =
-    SiteMeta { siteAuthor = "Me"
-             , baseUrl = "https://example.com"
-             , siteTitle = "My Slick Site"
-             , twitterHandle = Just "myslickhandle"
-             , githubUser = Just "myslickgithubuser"
+    SiteMeta { siteAuthor = "katsumata"
+             , baseUrl = "https://www-aos.eps.s.u-tokyo.ac.jp/~katsumata"
+             , siteTitle = "Ocean Circulation Research"
+             , bskyHandle = Just "kkats.bsky.social"
+             , githubUser = Just "kkats"
              }
 
 outputFolder :: FilePath
@@ -51,7 +59,7 @@ data SiteMeta =
     SiteMeta { siteAuthor    :: String
              , baseUrl       :: String -- e.g. https://example.ca
              , siteTitle     :: String
-             , twitterHandle :: Maybe String -- Without @
+             , bskyHandle :: Maybe String -- Without @
              , githubUser    :: Maybe String
              }
     deriving (Generic, Eq, Ord, Show, ToJSON)
@@ -59,8 +67,13 @@ data SiteMeta =
 -- | Data for the index page
 data IndexInfo =
   IndexInfo
-    { posts :: [Post]
+    { posts :: [Post],
+      alltags :: [Tag]
     } deriving (Generic, Show, FromJSON, ToJSON)
+
+data TagInfo = TagInfo { tagtag :: Tag,
+                         tagposts :: [Post]
+                       } deriving (Generic, Show, FromJSON, ToJSON)
 
 type Tag = String
 
@@ -85,40 +98,101 @@ data AtomData =
            , currentTime  :: String
            , atomUrl      :: String } deriving (Generic, ToJSON, Eq, Ord, Show)
 
+-- https://matsubara0507.github.io/posts/2021-06-13-my-site-use-slick.html
+groupByTag :: [Post] -> [(Tag, [Post])]
+groupByTag = HML.toList . foldl go mempty
+  where
+    go :: HML.HashMap Tag [Post] -> Post -> HML.HashMap Tag [Post]
+    go acc post = foldl (\acc' tag -> HML.insertWith (++) tag [post] acc') acc (tags post)
+
+buildTagPages :: [Post] -> Action [Tag]
+buildTagPages posts' = do
+    tagT <- compileTemplate' "site/templates/tag-list.html"
+    forM (groupByTag posts') $ \(tag0, posts0)
+                -> let tagInfo = TagInfo tag0 posts0
+                       taglistHTML = T.unpack $ substitute tagT (withSiteMeta $ toJSON tagInfo)
+                    in writeFile' (outputFolder </>  "tags" </> (tag0 ++ ".html")) taglistHTML
+                       >> return tag0
+
 -- | given a list of posts this will build a table of contents
-buildIndex :: [Post] -> Action ()
-buildIndex posts' = do
+buildIndex :: [Post] -> [Tag] -> Action ()
+buildIndex posts' tags' = do
+  postlistT <- compileTemplate' "site/templates/post-list.html"
+  let indexInfo = IndexInfo posts' tags'
+      postlistHTML = T.unpack $ substitute postlistT (withSiteMeta $ toJSON indexInfo)
+  writeFile' (outputFolder </> "posts/post-list.html") postlistHTML
+  
   indexT <- compileTemplate' "site/templates/index.html"
-  let indexInfo = IndexInfo {posts = posts'}
-      indexHTML = T.unpack $ substitute indexT (withSiteMeta $ toJSON indexInfo)
+  let indexHTML = T.unpack $ substitute indexT (withSiteMeta $ toJSON indexInfo)
   writeFile' (outputFolder </> "index.html") indexHTML
+
+buildIndexE :: Action ()
+buildIndexE = do
+  indexT <- compileTemplate' "site/templates/index-e.html"
+  let indexHTML = T.unpack $ substitute indexT (toJSON siteMeta)
+  writeFile' (outputFolder </> "index-e.html") indexHTML
 
 -- | Find and build all posts
 buildPosts :: Action [Post]
 buildPosts = do
-  pPaths <- getDirectoryFiles "." ["site/posts//*.md"]
+  pPaths <- sortBy (\a b -> b `compare` a) `fmap` getDirectoryFiles "." ["site/posts//*.md"] -- Newer to older by filename
   forP pPaths buildPost
 
 -- | Load a post, process metadata, write it to output, then return the post object
 -- Detects changes to either post content or template
+--
+-- local rule: If 7th character of the filename is 'M'
+-- use MathJax
+--
 buildPost :: FilePath -> Action Post
 buildPost srcPath = cacheAction ("build" :: T.Text, srcPath) $ do
   liftIO . putStrLn $ "Rebuilding post: " <> srcPath
+  -- local rule
+  let filenameOnly = dropDirectory1 . dropDirectory1 $ srcPath
+      templateHere = if length filenameOnly > 7 && filenameOnly !! 6 == 'M'
+                       then "site/templates/postWithMJ.html"
+                       else "site/templates/post.html"
   postContent <- readFile' srcPath
-  -- load post content and metadata as JSON blob
-  postData <- markdownToHTML . T.pack $ postContent
-  let postUrl = T.pack . dropDirectory1 $ srcPath -<.> "html"
+  -- load post content and metadata as JSON blob - with MathJax
+  let defaultHtml5OptionsWMJ :: WriterOptions
+      defaultHtml5OptionsWMJ = def {writerHighlightStyle = Just tango,
+                                    writerExtensions = writerExtensions def,
+                                    writerHTMLMathMethod = MathJax ""}
+  let defaultMarkdownOptionsWMJ :: ReaderOptions
+      defaultMarkdownOptionsWMJ = def { readerExtensions = mconcat
+                                                   [extensionsFromList
+                                                    [Ext_yaml_metadata_block, Ext_fenced_code_attributes,
+                                                     Ext_auto_identifiers, Ext_footnotes,
+                                                     Ext_tex_math_dollars, Ext_tex_math_double_backslash],       
+                                                    githubMarkdownExtensions] }
+  postData <- markdownToHTMLWithOpts defaultMarkdownOptionsWMJ defaultHtml5OptionsWMJ . T.pack $ postContent
+  -- liftIO $ print postData
+  let postUrl = T.pack . dropDirectory1 . dropDirectory1 $ srcPath -<.> "html"
       withPostUrl = _Object . at "url" ?~ String postUrl
   -- Add additional metadata we've been able to compute
   let fullPostData = withSiteMeta . withPostUrl $ postData
-  template <- compileTemplate' "site/templates/post.html"
-  writeFile' (outputFolder </> T.unpack postUrl) . T.unpack $ substitute template fullPostData
+  template <- compileTemplate' templateHere -- "site/templates/post.html"
+  writeFile' (outputFolder </> "posts" </> T.unpack postUrl) . T.unpack $ substitute template fullPostData
   convert fullPostData
+
+-- | compile research/contents.md and output to research/contents.html
+buildResearch, buildResearchE :: Action ()
+buildResearch = cacheAction ("research" :: T.Text, "site/research/contents.md" :: FilePath) $ do
+    researchContent <- readFile' "site/research/contents.md"
+    researchData <- markdownToHTML . T.pack $ researchContent
+    researchT <- compileTemplate' "site/templates/research.html"
+    writeFile' (outputFolder </> "research/research.html") (T.unpack $ substitute researchT researchData)
+buildResearchE = cacheAction ("research" :: T.Text, "site/research/contents-e.md" :: FilePath) $ do
+    researchContent <- readFile' "site/research/contents-e.md"
+    researchData <- markdownToHTML . T.pack $ researchContent
+    researchT <- compileTemplate' "site/templates/research-e.html"
+    writeFile' (outputFolder </> "research/research-e.html") (T.unpack $ substitute researchT researchData)
+
 
 -- | Copy all static files from the listed folders to their destination
 copyStaticFiles :: Action ()
 copyStaticFiles = do
-    filepaths <- getDirectoryFiles "./site/" ["images//*", "css//*", "js//*"]
+    filepaths <- getDirectoryFiles "site/" ["images//*", "css//*", "research//*"]
     void $ forP filepaths $ \filepath ->
         copyFileChanged ("site" </> filepath) (outputFolder </> filepath)
 
@@ -126,13 +200,13 @@ formatDate :: String -> String
 formatDate humanDate = toIsoDate parsedTime
   where
     parsedTime =
-      parseTimeOrError True defaultTimeLocale "%b %e, %Y" humanDate :: UTCTime
+      parseTimeOrError True defaultTimeLocale "%e %b %Y" humanDate :: UTCTime
 
-rfc3339 :: Maybe String
-rfc3339 = Just "%H:%M:%SZ"
-
+-- rfc3339 :: Maybe String
+-- rfc3339 = Just "%H:%M:%SZ"
 toIsoDate :: UTCTime -> String
-toIsoDate = formatTime defaultTimeLocale (iso8601DateFormat rfc3339)
+-- toIsoDate = formatTime defaultTimeLocale (iso8601DateFormat rfc3339)
+toIsoDate = formatShow iso8601Format
 
 buildFeed :: [Post] -> Action ()
 buildFeed posts' = do
@@ -157,11 +231,17 @@ buildFeed posts' = do
 buildRules :: Action ()
 buildRules = do
   allPosts <- buildPosts
-  buildIndex allPosts
+  allTags <- buildTagPages allPosts
+  buildIndex allPosts allTags
+  buildIndexE
   buildFeed allPosts
   copyStaticFiles
+  -- added
+  buildResearch
+  buildResearchE
 
 main :: IO ()
 main = do
-  let shOpts = shakeOptions { shakeVerbosity = Verbose, shakeLintInside = ["\\"]}
+  let shOpts = shakeOptions { shakeVerbosity = Verbose, shakeLintInside = ["\\"],
+                              shakeRebuild = [(RebuildNow, outputFolder </> "tags//*.html")]} -- tag lists needs rebuid everytime
   shakeArgsForward shOpts buildRules

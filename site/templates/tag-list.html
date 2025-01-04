@@ -12,20 +12,20 @@
    <div class="wrapper">
       <div class="mathead">
         <span class="title">
-        <h3>
-            Tags: {{#alltags}} <span class="margin"><a href="../tags/{{.}}.html">{{.}}</a></span> {{/alltags}}
-        </h3>
+        <h1>
+            Tag: {{tagtag}}
+        </h1>
         </span>
       </div>
    </div>
 <section class="table-of-conents">
 <div class="metadata"></div>
 <ul>
-    {{#posts}}
+    {{#tagposts}}
         <li>
-            <a href="{{url}}">{{title}} <span class="date">{{date}}</span> </a>
+            <a href="../posts/{{url}}">{{title}} <span class="date">{{date}}</span> </a>
         </li>
-    {{/posts}}
+    {{/tagposts}}
 </ul>
 </section>
 </div>
