@@ -9,4 +9,4 @@ math symbols.
 + Added tag pages following [ひげメモ](https://matsubara0507.github.io/posts/2021-06-13-my-site-use-slick.html).
 + Twitter → Bluesky
 + MathJax capability for blog posts
-+ Added test server capability after [A simple HTTP server in Haskell](https://docs.haskellstack.org/en/stable/)
++ Added test server capability after [A simple HTTP server in Haskell](https://remusao.github.io/posts/simple-http-server-haskell.html)
