@@ -68,8 +68,16 @@ data SiteMeta =
 data IndexInfo =
   IndexInfo
     { posts :: [Post],
-      alltags :: [Tag]
+      alltags :: [Tag],
+      prevlist :: Bool,
+      prevnum :: String,
+      nextlist :: Bool,
+      nextnum :: String
     } deriving (Generic, Show, FromJSON, ToJSON)
+
+-- | number of entries on a page of blog list
+listLength :: Int
+listLength = 10
 
 data TagInfo = TagInfo { tagtag :: Tag,
                          tagposts :: [Post]
@@ -118,12 +126,28 @@ buildTagPages posts' = do
 buildIndex :: [Post] -> [Tag] -> Action ()
 buildIndex posts' tags' = do
   postlistT <- compileTemplate' "site/templates/post-list.html"
-  let indexInfo = IndexInfo posts' tags'
-      postlistHTML = T.unpack $ substitute postlistT (withSiteMeta $ toJSON indexInfo)
-  writeFile' (outputFolder </> "posts/post-list.html") postlistHTML
+
+  let buildWithPage :: Int -> [Post] -> Action ()
+      buildWithPage _ [] = pure ()
+      buildWithPage n post0
+        | length post0 > listLength =
+                let post1 = take listLength post0
+                    indexInfo = if n < 1 then IndexInfo post1 tags' False "dummy" True (show $ n+1)
+                                         else IndexInfo post1 tags' True (show $ n-1) True (show $ n+1)
+                    postlistHTML = T.unpack $ substitute postlistT (withSiteMeta $ toJSON indexInfo)
+                 in writeFile' (outputFolder </> ("posts/post-list" ++ (show n) ++ ".html")) postlistHTML
+                    >> buildWithPage (n+1) (drop listLength post0)
+        | otherwise = do
+                let indexInfo = if n < 1 then IndexInfo post0 tags' False "dummy" True (show $ n+1)
+                                         else IndexInfo post0 tags' True (show $ n-1) False "dummy"
+                    postlistHTML = T.unpack $ substitute postlistT (withSiteMeta $ toJSON indexInfo)
+                 in writeFile' (outputFolder </> ("posts/post-list" ++ (show n) ++ ".html")) postlistHTML
+
+  buildWithPage 0 posts'
   
   indexT <- compileTemplate' "site/templates/index.html"
-  let indexHTML = T.unpack $ substitute indexT (withSiteMeta $ toJSON indexInfo)
+  -- let indexHTML = T.unpack $ substitute indexT (withSiteMeta $ toJSON indexInfo)
+  let indexHTML = T.unpack $ substitute indexT (toJSON siteMeta)  -- no need to merge indexInfo
   writeFile' (outputFolder </> "index.html") indexHTML
 
 buildIndexE :: Action ()
